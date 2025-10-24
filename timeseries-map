@@ -1,0 +1,147 @@
+/**
+ * NDVI time-series + map for Sentinel-2 over an agricultural field (or your AOI).
+ * Author: <Sadra Emamalizadeh>
+ * Last update: 2025-10-24
+ *
+ * Notes:
+ * - Keep using the GEE Code Editor (this is a script you can paste there).
+ * - You need a `geometry` feature/geometry in your workspace or draw one.
+ */
+
+// ========= Editable params (change these if you like) =========
+var AOI_NAME     = 'AOI';                       // used in labels/titles
+var START_DATE   = '2023-01-01';                  // study period start
+var END_DATE     = '2024-12-31';                  // study period end
+var CLOUD_MAX    = 40;                            // % cloud threshold
+var S2_ID        = 'COPERNICUS/S2_SR_HARMONIZED'; // sentinel-2 bottom-of-atmosphere collection
+var CHART_REDUCER = ee.Reducer.median();          // median? mean? up to you
+var CHART_SCALE   = 10;                           // meters (S2 native res)
+var NDVI_PALETTE  = ['CE7E45','DF923D','FCD163','529400','3E8601']; 
+var SHOW_BASEMAP  = 'SATELLITE';                  // 'SATELLITE' | 'HYBRID' | etc.
+
+// ========= Setup & collection filtering =========
+
+// assign the image collection to a variable named s2
+var s2 = ee.ImageCollection(S2_ID);
+
+// zoom to our area of interest in the map below
+Map.centerObject(geometry);
+Map.setOptions(SHOW_BASEMAP);
+
+// filter by date, clouds, and AOI bounds
+var filtered = s2
+  .filter(ee.Filter.date(START_DATE, END_DATE)) // filtering to period of our study
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', CLOUD_MAX)) // clouds reduce quality; skip > CLOUD_MAX
+  .filter(ee.Filter.bounds(geometry)); // filtering to our area of interest
+
+// ========= Cloud masking (removes cloudy pixels) =========
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+              .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image
+    .updateMask(mask)
+    .select('B.*') // keep spectral bands
+    .copyProperties(image, ['system:time_start']);
+}
+filtered = filtered.map(maskS2clouds);
+
+// ========= NDVI band (per image) =========
+function addNDVI(image) {
+  var NDVI = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(NDVI);
+}
+var withNdvi = filtered.map(addNDVI);
+
+// log the collection (nice to see counts/dates on the right)
+print('Collection with NDVI:', withNdvi);
+
+// ========= Time-series chart =========
+var chartTitle = 'NDVI Time Series ' + AOI_NAME + ' (' + START_DATE + ' to ' + END_DATE + ')';
+
+var chart = ui.Chart.image.series({
+  imageCollection: withNdvi.select('NDVI'),
+  region: geometry,
+  reducer: CHART_REDUCER, // median? mean? each image has lots of pixels; chart shows 1 value per date
+  scale: CHART_SCALE
+}).setOptions({
+  lineWidth: 1,
+  title: chartTitle, // you can change the title
+  interpolateNulls: true,
+  vAxis: { title: 'NDVI' },
+  hAxis: { title: '', format: 'MMM yy' }
+});
+print(chart);
+
+// ========= Map visualization of NDVI (e.g., for thesis figures) =========
+
+// display the site name (big label)
+var siteNameLabel = ui.Label({
+  value: AOI_NAME,
+  style: {
+    position: 'top-right',
+    fontWeight: 'bold',
+    fontSize: '36px',
+    margin: '8px'
+  }
+});
+Map.add(siteNameLabel);
+
+// some stuff for better visualisation of the NDVI map
+var composite = withNdvi.median(); // or mean
+var ndviComposite = composite.select('NDVI').clip(geometry);
+
+// I put min = 0, because I checked and NDVI for AOI was > 0. Adjust if needed.
+var ndviVis = { min: 0, max: 1, palette: NDVI_PALETTE };
+
+Map.addLayer(ndviComposite, ndviVis, 'Median NDVI over ' + AOI_NAME);
+
+// ========= Legend (simple + large labels) =========
+
+// create a panel to hold the legend
+var legendPanel = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+// add a title for the legend
+legendPanel.add(ui.Label({
+  value: 'NDVI Range',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '30px',
+    margin: '0 0 4px 0'
+  }
+}));
+
+// NDVI category ranges (aligned with the palette above)
+var ndviRanges = ['0 to 0.2', '0.2 to 0.4', '0.4 to 0.6', '0.6 to 0.8', '0.8 to 1'];
+
+// create and add color boxes and labels with numerical values to the legend panel
+NDVI_PALETTE.forEach(function(colorHex, i) {
+  var label = ui.Label({
+    value: ndviRanges[i],
+    style: {
+      backgroundColor: '#' + colorHex,
+      padding: '12px',
+      margin: '0 0 6px 0',
+      fontSize: '30px',
+      fontWeight: 'bold'
+    }
+  });
+  legendPanel.add(label);
+});
+Map.add(legendPanel);
+
+/* ========= Optional export (commented; flip on if you need a GeoTIFF) =========
+Export.image.toDrive({
+image: ndviComposite,
+description: 'NDVI_Median_' + AOI_NAME + '_' + START_DATE + '_to_' + END_DATE,
+region: geometry,
+scale: 10,
+maxPixels: 1e13
+});
